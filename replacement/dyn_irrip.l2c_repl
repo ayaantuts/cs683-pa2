@@ -1,0 +1,252 @@
+#include "cache.h"
+
+/*
+ * ============================================================================
+ *  Prefetch-aware Dynamic I-RRIP  (L2C replacement)
+ *  CS683 PA2, Task 2B + Task 3
+ * ============================================================================
+ *
+ *  Base (Task 2B): Dynamic I-RRIP with set dueling
+ *  ------------------------------------------------
+ *  - 2-bit RRPV per line (maxRRPV = 3).
+ *  - NUM_LEADER_SETS leader sets (every LEADER_STRIDE-th set) always run
+ *    plain SRRIP. In those sets we count instruction / total accesses and
+ *    misses. Follower sets use
+ *        ratio = (instr_acc + instr_miss) / (total_acc + total_miss)
+ *    ratio >  DYN_THRESH  -> I-RRIP mode   (prioritise instruction lines)
+ *    ratio <= DYN_THRESH  -> SRRIP mode
+ *    Counters are halved every DECAY_PERIOD leader accesses, so the decision
+ *    follows program phases.
+ *  - I-RRIP mode:
+ *        insertion : instruction -> RRPV 0, data -> RRPV maxRRPV-1
+ *        promotion : hit -> RRPV 0
+ *        eviction  : among RRPV==max lines, evict a data line before an
+ *                    instruction line
+ *
+ *  Task 3: prefetch awareness (PREFETCH_AWARE = 1)
+ *  ------------------------------------------------
+ *  L1D SPP prefetches reach L2 as packets with type == PREFETCH, and each
+ *  L2 block carries block.prefetch = 1 until its first demand hit.
+ *
+ *   (1) Insertion of prefetched data lines:
+ *         RRPV = maxRRPV-1 if L2 prefetch usefulness is high,
+ *         RRPV = maxRRPV   otherwise (they are the first to go).
+ *       Usefulness is a 4-bit saturating counter: +1 when a demand hits a
+ *       prefetched line at L2, -1 when a prefetched line is evicted from L2
+ *       without ever being demanded.
+ *   (2) Prefetch hits do not promote (a PREFETCH that hits in L2 is just the
+ *       L1D pulling the line up; it says nothing about L2 reuse).
+ *   (3) The first demand hit on a prefetched line promotes it only to
+ *       RRPV 1 (instructions: 0); a further hit promotes to 0. A prefetched
+ *       line must show real reuse before it is protected like demand data.
+ *   (4) Eviction priority among RRPV==max lines:
+ *         unused prefetched line > data line (I-RRIP mode) > any line.
+ *   (5) Set dueling counts only demand traffic (LOAD/RFO/translations).
+ *       Prefetch fills/hits are excluded, otherwise an aggressive SPP inflates
+ *       the "data" share and wrongly pushes the followers into SRRIP mode,
+ *       losing instruction protection exactly when SPP is active.
+ * ============================================================================
+ */
+
+#ifndef PREFETCH_AWARE
+#define PREFETCH_AWARE 1         // 0 -> plain Task 2B Dynamic I-RRIP
+#endif
+
+#ifndef DYN_THRESH
+#define DYN_THRESH 0.25          // set-dueling decision threshold
+#endif
+
+#define maxRRPV          3
+#define LEADER_STRIDE    16      // 1024/16 = 64 leader sets
+#define NUM_LEADER_SETS  (L2C_SET / LEADER_STRIDE)
+#define DECAY_PERIOD     8192    // leader accesses between counter halvings
+
+#define PF_CONF_MAX      15      // 4-bit usefulness counter
+#define PF_CONF_INIT     8
+#define PF_CONF_THRESH   8
+
+static uint8_t  l2_rrpv[L2C_SET][L2C_WAY];
+static uint8_t  l2_pf_reused[L2C_SET][L2C_WAY];   // prefetched line got its 1st demand hit
+
+// set-dueling counters (leader sets, SRRIP)
+static uint32_t sd_instr_acc, sd_instr_miss, sd_total_acc, sd_total_miss, sd_period;
+
+// prefetch usefulness at L2
+static uint32_t pf_conf = PF_CONF_INIT;
+
+// stats
+static uint64_t st_follower_irrip, st_follower_rrip;
+static uint64_t st_pf_fill_near, st_pf_fill_far, st_pf_demand_hit, st_pf_dead_evict, st_pf_victim_pick;
+
+static inline bool is_leader_set(uint32_t set)
+{
+    return (set % LEADER_STRIDE) == 0;
+}
+
+static inline bool irrip_mode_on()
+{
+    uint64_t den = (uint64_t)sd_total_acc + sd_total_miss;
+    if (den == 0)
+        return false;
+    double ratio = (double)((uint64_t)sd_instr_acc + sd_instr_miss) / (double)den;
+    return ratio > DYN_THRESH;
+}
+
+static inline bool is_demand(uint32_t type)
+{
+    return type == LOAD || type == RFO || type == LOAD_TRANSLATION;
+}
+
+// initialize replacement state
+void CACHE::l2c_initialize_replacement()
+{
+    cout << "Initialize Dynamic I-RRIP state for L2C"
+         << " (prefetch-aware=" << PREFETCH_AWARE << ", threshold=" << DYN_THRESH
+         << ", leader sets=" << NUM_LEADER_SETS << ")" << endl;
+
+    for (int i = 0; i < L2C_SET; i++)
+        for (int j = 0; j < L2C_WAY; j++) {
+            l2_rrpv[i][j] = maxRRPV;
+            l2_pf_reused[i][j] = 0;
+        }
+    sd_instr_acc = sd_instr_miss = sd_total_acc = sd_total_miss = sd_period = 0;
+    pf_conf = PF_CONF_INIT;
+}
+
+// find replacement victim
+uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
+{
+    // invalid way first
+    for (int i = 0; i < L2C_WAY; i++)
+        if (!current_set[i].valid)
+            return i;
+
+    bool irrip = (!is_leader_set(set)) && irrip_mode_on();
+
+    while (1)
+    {
+#if PREFETCH_AWARE
+        // (4a) a prefetched line that was never demanded
+        for (int i = 0; i < L2C_WAY; i++)
+            if (l2_rrpv[set][i] == maxRRPV && current_set[i].prefetch) {
+                st_pf_victim_pick++;
+                return i;
+            }
+#endif
+        // (4b) I-RRIP: data before instruction
+        if (irrip) {
+            for (int i = 0; i < L2C_WAY; i++)
+                if (l2_rrpv[set][i] == maxRRPV && !current_set[i].instruction)
+                    return i;
+        }
+        // (4c) any line at maxRRPV
+        for (int i = 0; i < L2C_WAY; i++)
+            if (l2_rrpv[set][i] == maxRRPV)
+                return i;
+
+        for (int i = 0; i < L2C_WAY; i++)
+            l2_rrpv[set][i]++;
+    }
+
+    // WE SHOULD NOT REACH HERE
+    assert(0);
+    return 0;
+}
+
+// called on every cache hit and cache fill
+void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit, uint8_t isInstruction)
+{
+    if ((type == WRITEBACK) && ip)
+        assert(0);
+
+    bool leader = is_leader_set(set);
+
+    // ----------------- set-dueling bookkeeping (leader sets) -----------------
+#if PREFETCH_AWARE
+    bool count_it = is_demand(type);                       // (5) demand only
+#else
+    bool count_it = (type != WRITEBACK);
+#endif
+    if (leader && count_it) {
+        sd_total_acc++;
+        if (!hit) sd_total_miss++;
+        if (isInstruction) {
+            sd_instr_acc++;
+            if (!hit) sd_instr_miss++;
+        }
+        if (++sd_period >= DECAY_PERIOD) {
+            sd_instr_acc >>= 1; sd_instr_miss >>= 1;
+            sd_total_acc >>= 1; sd_total_miss >>= 1;
+            sd_period = 0;
+        }
+    }
+
+    bool irrip = (!leader) && irrip_mode_on();
+    if (!leader) {
+        if (irrip) st_follower_irrip++; else st_follower_rrip++;
+    }
+
+    // ----------------------------- hit (promotion) ---------------------------
+    if (hit) {
+#if PREFETCH_AWARE
+        // (2) prefetch request hitting in L2: no promotion
+        if (type == PREFETCH)
+            return;
+
+        // (3) first demand hit on a prefetched line
+        // (block[set][way].prefetch is cleared by cache.cc right after this call)
+        if (block[set][way].prefetch && type != WRITEBACK) {
+            if (pf_conf < PF_CONF_MAX) pf_conf++;
+            st_pf_demand_hit++;
+            l2_pf_reused[set][way] = 1;
+            l2_rrpv[set][way] = isInstruction ? 0 : 1;
+            return;
+        }
+#endif
+        l2_rrpv[set][way] = 0;
+        return;
+    }
+
+    // ----------------------------- miss (insertion) --------------------------
+    // block[set][way] still holds the victim here (fill_cache runs afterwards)
+#if PREFETCH_AWARE
+    if (block[set][way].valid && block[set][way].prefetch) {
+        if (pf_conf > 0) pf_conf--;                        // useless prefetch evicted
+        st_pf_dead_evict++;
+    }
+#endif
+    l2_pf_reused[set][way] = 0;
+
+#if PREFETCH_AWARE
+    // (1) prefetched data line
+    if (type == PREFETCH && !isInstruction) {
+        if (pf_conf >= PF_CONF_THRESH) {
+            l2_rrpv[set][way] = maxRRPV - 1;
+            st_pf_fill_near++;
+        } else {
+            l2_rrpv[set][way] = maxRRPV;
+            st_pf_fill_far++;
+        }
+        return;
+    }
+#endif
+
+    if (irrip)
+        l2_rrpv[set][way] = isInstruction ? 0 : (maxRRPV - 1);
+    else
+        l2_rrpv[set][way] = maxRRPV - 1;   // SRRIP insertion (RRPV 2)
+}
+
+// use this function to print out your own stats at the end of simulation
+void CACHE::l2c_replacement_final_stats()
+{
+    uint64_t f = st_follower_irrip + st_follower_rrip;
+    cout << "L2C Dynamic I-RRIP: prefetch-aware=" << PREFETCH_AWARE << " threshold=" << DYN_THRESH << endl;
+    cout << "L2C follower accesses in I-RRIP mode: " << st_follower_irrip
+         << " (" << (f ? 100.0 * st_follower_irrip / f : 0.0) << "%)  in SRRIP mode: " << st_follower_rrip << endl;
+#if PREFETCH_AWARE
+    cout << "L2C PF-aware: pf fills near(RRPV2)=" << st_pf_fill_near << " far(RRPV3)=" << st_pf_fill_far
+         << " demand-hits-on-pf=" << st_pf_demand_hit << " dead-pf-evictions=" << st_pf_dead_evict
+         << " dead-pf-victim-picks=" << st_pf_victim_pick << " final pf_conf=" << pf_conf << endl;
+#endif
+}

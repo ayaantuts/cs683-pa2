@@ -1,270 +1,292 @@
 #include "cache.h"
 
-#define IP_TRACKER_COUNT 128
-#define PATTERN_COUNT 256
-#define PT_INDEX_BITS 8
-#define CONF_MAX 3
-#define CONF_NEEDED 2
-#define EPOCH 256
-#define START_DEGREE 4
+/*
+ * ---------------
+ *  Two structures:
+ *
+ *   1) IP Table (IPT) - fully associative, IPT_ENTRIES entries, LRU.
+ *      Per IP it keeps the last line address, the last stride, a 2-bit
+ *      "uniform stride" confidence and a 12-bit stride-history signature.
+ *
+ *   2) Pattern Table (PT) - direct mapped, PT_ENTRIES entries, indexed by a
+ *      fold of the signature. Each entry maps "the recent stride history"
+ *      -> "next expected stride" with a 2-bit confidence.
+ *
+ *  Dual pattern classification:
+ *    - Uniform stride: same stride seen repeatedly -> uniform confidence
+ *      saturates (== UNIFORM_THRESH) -> prefetch  A+s, A+2s, ..., A+degree*s.
+ *      Uniform has priority.
+ *    - Non-uniform stride: uniform confidence never saturates (any mismatch
+ *      halves it), so the prefetcher falls back to the signature path:
+ *      look up PT[sig] -> next stride, then *look ahead* by updating a
+ *      speculative signature with the predicted stride, repeating up to
+ *      `degree` times (stopping on low PT confidence).
+ *      e.g. (+1,+2,+2,+2,+3)^n : every 3-stride context is unique, so the
+ *      12-bit signature (covers the last ~4 strides) predicts each next
+ *      stride exactly.
+ *
+ *  Prefetches never cross the 4 KB page of the triggering access.
+ *
+ *  Accuracy-based throttling:
+ *    Every EPOCH prefetches that actually go to L2 (pf_lower_level), we
+ *    compute accuracy = useful / issued-to-lower-level over that epoch and
+ *    pick the degree from DEGREE_TABLE.
+ * =============
+ */
 
-class IP_ENTRY {
-  public:
-    uint64_t ip;
-    uint64_t last_cl_addr;
-    int64_t last_stride;
-    int conf;
-    unsigned signature;
-    bool use_pattern;
-    uint32_t lru;
+// -------- Configuration ----------------
+#define IPT_ENTRIES        32
+#define IP_TAG_BITS        10
+#define LAST_ADDR_BITS     24      // low bits of last line address kept per IP
+#define STRIDE_BITS        7       // signed, range [-64, 63]  (page has 64 lines)
+#define SIG_BITS           12
+#define SIG_SHIFT          3
+#define PT_INDEX_BITS      9
+#define PT_ENTRIES         (1 << PT_INDEX_BITS)
 
-    IP_ENTRY () {
-        ip = 0;
-        last_cl_addr = 0;
-        last_stride = 0;
-        conf = 0;
-        signature = 0;
-        use_pattern = false;
-        lru = 0;
-    };
+#define UNIFORM_CONF_MAX   3       // 2-bit counter
+#define UNIFORM_THRESH     3       // must be saturated to be "uniform"
+#define PT_CONF_MAX        3       // 2-bit counter
+#define PT_CONF_THRESH     2       // min confidence to follow a PT prediction
+
+#define EPOCH              256     // prefetches to L2 per accuracy epoch
+#define MAX_DEGREE         6
+#define INIT_DEGREE        4
+
+#define IP_TAG_MASK        ((1ULL << IP_TAG_BITS) - 1)
+#define LAST_ADDR_MASK     ((1ULL << LAST_ADDR_BITS) - 1)
+#define SIG_MASK           ((1u << SIG_BITS) - 1)
+#define STRIDE_MASK        ((1u << STRIDE_BITS) - 1)
+#define MAX_ABS_STRIDE     63
+
+// ---------------- Tables ----------------
+struct SPP_IPT_ENTRY {
+    uint8_t  valid;
+    uint16_t ip_tag;         // IP_TAG_BITS
+    uint32_t last_addr;      // LAST_ADDR_BITS (line address)
+    int8_t   last_stride;    // STRIDE_BITS
+    uint8_t  conf;           // 2 bits
+    uint16_t sig;            // SIG_BITS
+    uint8_t  lru;            // log2(IPT_ENTRIES) bits
 };
 
-class PATTERN_ENTRY {
-  public:
-    unsigned tag;
-    int64_t next_stride;
-    int conf;
-
-    PATTERN_ENTRY () {
-        tag = 0;
-        next_stride = 0;
-        conf = 0;
-    };
+struct SPP_PT_ENTRY {
+    int8_t  delta;           // STRIDE_BITS
+    uint8_t conf;            // 2 bits
 };
 
-static IP_ENTRY trackers[IP_TRACKER_COUNT];
-static PATTERN_ENTRY patterns[PATTERN_COUNT];
-static unsigned degree = START_DEGREE;
+static SPP_IPT_ENTRY spp_ipt[NUM_CPUS][IPT_ENTRIES];
+static SPP_PT_ENTRY  spp_pt[NUM_CPUS][PT_ENTRIES];
 
-static uint64_t uniform_requests = 0, pattern_requests = 0;
-static uint64_t miss_new_ip = 0, miss_predicted = 0, miss_unpredicted = 0;
+// throttling state
+static uint32_t spp_degree[NUM_CPUS];
+static uint64_t spp_snap_useful[NUM_CPUS], spp_snap_lower[NUM_CPUS];
 
-static void touch_tracker(int index)
+// stats
+static uint64_t spp_pf_uniform[NUM_CPUS], spp_pf_pattern[NUM_CPUS];
+static uint64_t spp_degree_hist[NUM_CPUS][MAX_DEGREE + 1];
+
+// ---------------- Helpers ----------------
+static inline uint16_t spp_ip_hash(uint64_t ip)
 {
-    for (int i=0; i<IP_TRACKER_COUNT; i++) {
-        if (trackers[i].lru < trackers[index].lru)
-            trackers[i].lru++;
-    }
-    trackers[index].lru = 0;
+    return (uint16_t)((ip ^ (ip >> IP_TAG_BITS) ^ (ip >> (2 * IP_TAG_BITS))) & IP_TAG_MASK);
 }
 
-static unsigned next_signature(unsigned sig, int64_t stride)
+static inline uint16_t spp_next_sig(uint16_t sig, int32_t stride)
 {
-    return ((sig << 3) ^ (stride & 0x7F)) & 0xFFF;
+    return (uint16_t)(((sig << SIG_SHIFT) ^ ((uint32_t)stride & STRIDE_MASK)) & SIG_MASK);
 }
 
-static PATTERN_ENTRY &pattern_slot(unsigned sig)
+static inline uint32_t spp_pt_index(uint16_t sig)
 {
-    return patterns[(sig ^ (sig >> PT_INDEX_BITS)) & (PATTERN_COUNT - 1)];
+    return (sig ^ (sig >> PT_INDEX_BITS)) & (PT_ENTRIES - 1);
 }
 
-static int64_t predict(unsigned sig)
+// stride between two LAST_ADDR_BITS-wide line addresses (sign-extended)
+static inline int64_t spp_stride(uint64_t cur, uint64_t last)
 {
-    PATTERN_ENTRY &p = pattern_slot(sig);
-    if (p.conf < CONF_NEEDED || p.tag != (sig >> PT_INDEX_BITS))
-        return 0;
-    return p.next_stride;
+    int64_t d = (int64_t)((cur - last) & LAST_ADDR_MASK);
+    if (d & (1LL << (LAST_ADDR_BITS - 1)))
+        d -= (1LL << LAST_ADDR_BITS);
+    return d;
 }
 
-static void learn_pattern(unsigned sig, int64_t stride)
+// accuracy (%) -> degree. See summary for the rationale.
+static inline uint32_t spp_degree_for_accuracy(double acc)
 {
-    PATTERN_ENTRY &p = pattern_slot(sig);
-    unsigned tag = sig >> PT_INDEX_BITS;
-
-    if (p.conf == 0) {
-        p.tag = tag;
-        p.next_stride = stride;
-        p.conf = 1;
-    }
-    else if (p.tag != tag)
-        p.conf--;
-    else if (p.next_stride == stride) {
-        if (p.conf < CONF_MAX)
-            p.conf++;
-    }
-    else if (p.conf > 1)
-        p.conf--;
-    else
-        p.next_stride = stride;
+    if (acc >= 0.80) return 6;
+    if (acc >= 0.60) return 4;
+    if (acc >= 0.40) return 2;
+    return 1;
 }
 
-static void update_degree(uint64_t useful, uint64_t useless)
+static void spp_touch_lru(uint32_t cpu, int idx)
 {
-    static uint64_t last_useful = 0, last_useless = 0;
-
-    if (useful < last_useful || useless < last_useless) {
-        last_useful = useful;
-        last_useless = useless;
-        return;
-    }
-
-    uint64_t good = useful - last_useful;
-    uint64_t bad = useless - last_useless;
-    if (good + bad < EPOCH)
-        return;
-
-    uint64_t accuracy = 100 * good / (good + bad);
-    if (accuracy >= 75)
-        degree = 8;
-    else if (accuracy >= 50)
-        degree = 4;
-    else if (accuracy >= 25)
-        degree = 2;
-    else
-        degree = 1;
-
-    last_useful = useful;
-    last_useless = useless;
+    for (int i = 0; i < IPT_ENTRIES; i++)
+        if (spp_ipt[cpu][i].lru < spp_ipt[cpu][idx].lru)
+            spp_ipt[cpu][i].lru++;
+    spp_ipt[cpu][idx].lru = 0;
 }
 
+// ------------ ChampSim hooks --------------
 void CACHE::l1d_prefetcher_initialize()
 {
-    cout << "CPU " << cpu << " L1D Stride Pattern Prefetcher (signature)" << endl;
-    for (int i=0; i<IP_TRACKER_COUNT; i++)
-        trackers[i].lru = i;
+    std::cout << "------------------------------------------------" << std::endl;
+    std::cout << "        Stride Pattern Prefetcher (SPP)         " << std::endl;
+    std::cout << "------------------------------------------------" << std::endl;
+
+    for (int i = 0; i < IPT_ENTRIES; i++) {
+        spp_ipt[cpu][i].valid = 0;
+        spp_ipt[cpu][i].ip_tag = 0;
+        spp_ipt[cpu][i].last_addr = 0;
+        spp_ipt[cpu][i].last_stride = 0;
+        spp_ipt[cpu][i].conf = 0;
+        spp_ipt[cpu][i].sig = 0;
+        spp_ipt[cpu][i].lru = i;
+    }
+    for (int i = 0; i < PT_ENTRIES; i++) {
+        spp_pt[cpu][i].delta = 0;
+        spp_pt[cpu][i].conf = 0;
+    }
+    spp_degree[cpu] = INIT_DEGREE;
+    spp_snap_useful[cpu] = 0;
+    spp_snap_lower[cpu] = 0;
+    spp_pf_uniform[cpu] = spp_pf_pattern[cpu] = 0;
+    for (int i = 0; i <= MAX_DEGREE; i++) spp_degree_hist[cpu][i] = 0;
 }
 
 void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag)
 {
-    update_degree(pf_useful, pf_useless);
+    // ------------ accuracy-based throttling (epoch based) ------------
+    // pf_useful / pf_lower_level are this cache's own prefetch counters
+    // (the same ones used for "ACCURACY" in the ChampSim output). They are
+    // reset at the end of warmup, so re-sync the snapshot if they go back.
+    if (pf_lower_level < spp_snap_lower[cpu] || pf_useful < spp_snap_useful[cpu]) {
+        spp_snap_lower[cpu] = pf_lower_level;
+        spp_snap_useful[cpu] = pf_useful;
+    }
+    uint64_t ep_lower = pf_lower_level - spp_snap_lower[cpu];
+    if (ep_lower >= EPOCH) {
+        uint64_t ep_useful = pf_useful - spp_snap_useful[cpu];
+        double acc = (double)ep_useful / (double)ep_lower;
+        spp_degree[cpu] = spp_degree_for_accuracy(acc);
+        spp_snap_lower[cpu] = pf_lower_level;
+        spp_snap_useful[cpu] = pf_useful;
+    }
+    uint32_t degree = spp_degree[cpu];
+    spp_degree_hist[cpu][degree]++;
 
-    if (type != LOAD)
-        return;
-
+    // ------------- IP table lookup ------------
     uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;
+    uint32_t cur_addr = (uint32_t)(cl_addr & LAST_ADDR_MASK);
+    uint16_t tag = spp_ip_hash(ip);
 
-    int index;
-    for (index=0; index<IP_TRACKER_COUNT; index++) {
-        if (trackers[index].ip == ip)
-            break;
-    }
+    int idx = -1;
+    for (int i = 0; i < IPT_ENTRIES; i++)
+        if (spp_ipt[cpu][i].valid && spp_ipt[cpu][i].ip_tag == tag) { idx = i; break; }
 
-    if (index == IP_TRACKER_COUNT) {
-        for (index=0; index<IP_TRACKER_COUNT; index++) {
-            if (trackers[index].lru == (IP_TRACKER_COUNT-1))
-                break;
-        }
-
-        uint32_t lru = trackers[index].lru;
-        trackers[index] = IP_ENTRY();
-        trackers[index].lru = lru;
-        trackers[index].ip = ip;
-        trackers[index].last_cl_addr = cl_addr;
-        touch_tracker(index);
-
-        if (!cache_hit)
-            miss_new_ip++;
+    if (idx == -1) {
+        // allocate LRU entry
+        for (int i = 0; i < IPT_ENTRIES; i++)
+            if (spp_ipt[cpu][i].lru == IPT_ENTRIES - 1) { idx = i; break; }
+        SPP_IPT_ENTRY &n = spp_ipt[cpu][idx];
+        n.valid = 1;
+        n.ip_tag = tag;
+        n.last_addr = cur_addr;
+        n.last_stride = 0;
+        n.conf = 0;
+        n.sig = 0;
+        spp_touch_lru(cpu, idx);
         return;
     }
 
-    IP_ENTRY &t = trackers[index];
+    SPP_IPT_ENTRY &e = spp_ipt[cpu][idx];
+    spp_touch_lru(cpu, idx);
 
-    int64_t stride = (int64_t)(cl_addr - t.last_cl_addr);
-    t.last_cl_addr = cl_addr;
+    int64_t stride = spp_stride(cur_addr, e.last_addr);
+    if (stride == 0)
+        return;
 
-    if (stride == 0 || stride > 63 || stride < -64) {
-        if (!cache_hit)
-            miss_unpredicted++;
-        touch_tracker(index);
+    // strides beyond a page can never yield an in-page prefetch: restart
+    if (stride > MAX_ABS_STRIDE || stride < -MAX_ABS_STRIDE) {
+        e.last_addr = cur_addr;
+        e.last_stride = 0;
+        e.conf = 0;
+        e.sig = 0;
         return;
     }
 
-    int64_t guess = predict(t.signature);
-    bool stride_sure = t.conf >= CONF_NEEDED;
-    bool stride_right = (stride == t.last_stride);
-    bool pattern_right = (guess == stride);
-
-    if (stride_sure && !stride_right && pattern_right)
-        t.use_pattern = true;
-    if (stride_sure && stride_right && guess != 0 && !pattern_right)
-        t.use_pattern = false;
-
-    if (!cache_hit) {
-        if ((stride_sure && stride_right) || pattern_right)
-            miss_predicted++;
-        else
-            miss_unpredicted++;
+    // ------------- train: uniform-stride confidence -------------
+    if (stride == e.last_stride) {
+        if (e.conf < UNIFORM_CONF_MAX) e.conf++;
+    } else {
+        e.conf >>= 1;     // a break in the pattern quickly drops "uniform"
     }
 
-    if (stride_right) {
-        if (t.conf < CONF_MAX)
-            t.conf++;
-    }
-    else {
-        t.last_stride = stride;
-        t.conf = 1;
-    }
-
-    learn_pattern(t.signature, stride);
-    t.signature = next_signature(t.signature, stride);
-
-    bool stride_ready = t.conf >= CONF_NEEDED;
-    bool pattern_ready = predict(t.signature) != 0;
-
-    if (stride_ready && !(t.use_pattern && pattern_ready)) {
-        for (unsigned i=1; i<=degree; i++) {
-            uint64_t pf_address = (cl_addr + t.last_stride * i) << LOG2_BLOCK_SIZE;
-
-            if ((pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE))
-                break;
-
-            if (MSHR.occupancy < (MSHR.SIZE>>1))
-                prefetch_line(ip, addr, pf_address, FILL_L1, 0);
-            else
-                prefetch_line(ip, addr, pf_address, FILL_L2, 0);
-            uniform_requests++;
-        }
-    }
-    else if (pattern_ready) {
-        unsigned sig = t.signature;
-
-        uint64_t pf_line = cl_addr;
-        for (unsigned i=1; i<=degree; i++) {
-            int64_t next = predict(sig);
-            if (next == 0)
-                break;
-
-            pf_line += next;
-            uint64_t pf_address = pf_line << LOG2_BLOCK_SIZE;
-            if ((pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE))
-                break;
-
-            if (MSHR.occupancy < (MSHR.SIZE>>1))
-                prefetch_line(ip, addr, pf_address, FILL_L1, 0);
-            else
-                prefetch_line(ip, addr, pf_address, FILL_L2, 0);
-            pattern_requests++;
-
-            sig = next_signature(sig, next);
+    // ------------- train: pattern table (old signature -> this stride) -------------
+    if (e.sig != 0) {
+        SPP_PT_ENTRY &p = spp_pt[cpu][spp_pt_index(e.sig)];
+        if (p.delta == stride) {
+            if (p.conf < PT_CONF_MAX) p.conf++;
+        } else if (p.conf > 0) {
+            p.conf--;
+        } else {
+            p.delta = (int8_t)stride;
+            p.conf = 1;
         }
     }
 
-    touch_tracker(index);
+    e.sig = spp_next_sig(e.sig, (int32_t)stride);
+    e.last_stride = (int8_t)stride;
+    e.last_addr = cur_addr;
+    // ------------- predict -------------
+    uint64_t page = addr >> LOG2_PAGE_SIZE;
+    int fill = (MSHR.occupancy < (MSHR.SIZE >> 1)) ? FILL_L1 : FILL_L2;
+
+    if (e.conf >= UNIFORM_THRESH) {
+        // Uniform stride (priority)
+        for (uint32_t k = 1; k <= degree; k++) {
+            uint64_t pf_addr = (uint64_t)((int64_t)cl_addr + stride * (int64_t)k) << LOG2_BLOCK_SIZE;
+            if ((pf_addr >> LOG2_PAGE_SIZE) != page)
+                break;
+            if (prefetch_line(ip, addr, pf_addr, fill, 0))
+                spp_pf_uniform[cpu]++;
+        }
+    } else {
+        // Non-uniform: signature lookahead through the pattern table
+        uint16_t sig = e.sig;
+        int64_t line = (int64_t)cl_addr;
+        for (uint32_t k = 1; k <= degree; k++) {
+            SPP_PT_ENTRY &p = spp_pt[cpu][spp_pt_index(sig)];
+            if (p.conf < PT_CONF_THRESH || p.delta == 0)
+                break;
+            line += p.delta;
+            uint64_t pf_addr = (uint64_t)line << LOG2_BLOCK_SIZE;
+            if ((pf_addr >> LOG2_PAGE_SIZE) != page)
+                break;
+            if (prefetch_line(ip, addr, pf_addr, fill, 0))
+                spp_pf_pattern[cpu]++;
+            sig = spp_next_sig(sig, p.delta);
+        }
+    }
 }
 
 void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t v_evicted_addr, uint64_t evicted_addr, uint32_t metadata_in)
 {
-    return;
+    return; //metadata_in;
 }
 
 void CACHE::l1d_prefetcher_final_stats()
 {
-    cout << "CPU " << cpu << " L1D SPP (signature) final stats" << endl;
-    cout << "Uniform prefetch requests: " << uniform_requests << endl;
-    cout << "Pattern prefetch requests: " << pattern_requests << endl;
-    cout << "Final degree: " << degree << endl;
-    cout << "L1D load misses by type:" << endl;
-    cout << "  new or evicted IP:          " << miss_new_ip << endl;
-    cout << "  predicted but not in time:  " << miss_predicted << endl;
-    cout << "  no stride pattern:          " << miss_unpredicted << endl;
+    cout << "CPU " << cpu << " L1D SPP final stats" << endl;
+    cout << "SPP uniform-stride prefetches: " << spp_pf_uniform[cpu]
+         << "  pattern(signature) prefetches: " << spp_pf_pattern[cpu] << endl;
+    cout << "SPP degree histogram (accesses):";
+    for (int d = 1; d <= MAX_DEGREE; d++)
+        if (spp_degree_hist[cpu][d]) cout << " d" << d << "=" << spp_degree_hist[cpu][d];
+    cout << endl;
+    uint64_t ipt_bits = (uint64_t)IPT_ENTRIES * (1 + IP_TAG_BITS + LAST_ADDR_BITS + STRIDE_BITS + 2 + SIG_BITS + 5);
+    uint64_t pt_bits  = (uint64_t)PT_ENTRIES * (STRIDE_BITS + 2);
+    cout << "SPP storage: IPT " << ipt_bits << " bits + PT " << pt_bits << " bits = "
+         << (ipt_bits + pt_bits) << " bits (" << (ipt_bits + pt_bits) / 8.0 / 1024.0 << " KB)" << endl;
 }

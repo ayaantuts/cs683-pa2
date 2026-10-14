@@ -1,0 +1,5 @@
+// Task 2B baseline for the Task 3 comparison:
+// the same Dynamic I-RRIP with the prefetch-aware logic switched off.
+// Build:  ./build_champsim.sh spp dyn_irrip_nopf spp_dynirrip_nopf
+#define PREFETCH_AWARE 0
+#include "dyn_irrip.l2c_repl"
