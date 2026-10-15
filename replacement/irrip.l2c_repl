@@ -1,0 +1,105 @@
+#include "cache.h"
+
+#define maxRRPV 3
+#define INSTR_INSERT_RRPV 0
+#define DATA_INSERT_RRPV  (maxRRPV - 1)
+
+uint32_t l2_rrpv[L2C_SET][L2C_WAY];
+bool     l2_is_instr[L2C_SET][L2C_WAY];
+
+uint64_t irrip_instr_fills = 0, irrip_data_fills = 0;
+uint64_t irrip_instr_hits  = 0, irrip_data_hits  = 0;
+uint64_t irrip_instr_victims = 0, irrip_data_victims = 0;
+uint64_t irrip_instr_saved = 0;   // instr line at maxRRPV skipped because a data line was also at maxRRPV
+
+void CACHE::l2c_initialize_replacement()
+{
+    cout << "Initialize I-RRIP state for L2C" << endl;
+
+    for (int i = 0; i < L2C_SET; i++) {
+        for (int j = 0; j < L2C_WAY; j++) {
+            l2_rrpv[i][j]     = maxRRPV;
+            l2_is_instr[i][j] = false;
+        }
+    }
+}
+
+uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
+{
+    while (1)
+    {
+        // pass 1: data line at maxRRPV
+        for (int i = 0; i < L2C_WAY; i++) {
+            if (l2_rrpv[set][i] == maxRRPV && !l2_is_instr[set][i]) {
+                if (warmup_complete[cpu]) {
+                    irrip_data_victims++;
+                    for (int j = 0; j < L2C_WAY; j++)
+                        if (l2_rrpv[set][j] == maxRRPV && l2_is_instr[set][j]) {
+                            irrip_instr_saved++;
+                            break;
+                        }
+                }
+                return i;
+            }
+        }
+
+        // pass 2: only instruction lines at maxRRPV
+        for (int i = 0; i < L2C_WAY; i++) {
+            if (l2_rrpv[set][i] == maxRRPV) {
+                if (warmup_complete[cpu])
+                    irrip_instr_victims++;
+                return i;
+            }
+        }
+
+        for (int i = 0; i < L2C_WAY; i++)
+            l2_rrpv[set][i]++;
+    }
+
+    // WE SHOULD NOT REACH HERE
+    assert(0);
+    return 0;
+}
+
+void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit, uint8_t isInstruction)
+{
+    if (hit) {
+        if (warmup_complete[cpu]) {
+            if (isInstruction) irrip_instr_hits++;
+            else               irrip_data_hits++;
+        }
+
+        if (isInstruction) {
+            l2_rrpv[set][way]     = 0;
+            l2_is_instr[set][way] = true;
+        } else if (l2_rrpv[set][way] > 0) {
+            l2_rrpv[set][way]--;
+        }
+    } else {
+        if (warmup_complete[cpu]) {
+            if (isInstruction) irrip_instr_fills++;
+            else               irrip_data_fills++;
+        }
+
+        l2_is_instr[set][way] = (isInstruction != 0);
+        l2_rrpv[set][way]     = isInstruction ? INSTR_INSERT_RRPV : DATA_INSERT_RRPV;
+    }
+}
+
+void CACHE::l2c_replacement_final_stats()
+{
+    uint64_t total_victims = irrip_instr_victims + irrip_data_victims;
+
+    cout << endl << "I-RRIP (L2C) replacement stats" << endl;
+    cout << "L2C instr fills:   " << irrip_instr_fills   << endl;
+    cout << "L2C data  fills:   " << irrip_data_fills    << endl;
+    cout << "L2C instr hits:    " << irrip_instr_hits    << endl;
+    cout << "L2C data  hits:    " << irrip_data_hits     << endl;
+    cout << "L2C instr victims: " << irrip_instr_victims << endl;
+    cout << "L2C data  victims: " << irrip_data_victims  << endl;
+    if (total_victims)
+        cout << "Fraction of victims that were instr lines: "
+             << (double)irrip_instr_victims / total_victims << endl;
+    cout << "Instr lines saved by data-first eviction: " << irrip_instr_saved << endl;
+    cout << endl;
+}
