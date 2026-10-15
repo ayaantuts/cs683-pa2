@@ -10,30 +10,30 @@
 
 class IP_ENTRY {
   public:
-    uint64_t ip;
-    uint64_t last_cl_addr;
-    int64_t last_stride;
-    int conf;
-    unsigned signature;
-    bool use_pattern;
-    uint32_t lru;
+    unsigned valid : 1;
+    unsigned tag : 8;
+    unsigned last_cl_addr : 16;
+    int last_stride : 7;
+    unsigned conf : 2;
+    unsigned signature : 12;
+    unsigned use_pattern : 1;
 
     IP_ENTRY () {
-        ip = 0;
+        valid = 0;
+        tag = 0;
         last_cl_addr = 0;
         last_stride = 0;
         conf = 0;
         signature = 0;
-        use_pattern = false;
-        lru = 0;
+        use_pattern = 0;
     };
 };
 
 class PATTERN_ENTRY {
   public:
-    unsigned tag;
-    int64_t next_stride;
-    int conf;
+    unsigned tag : 4;
+    int next_stride : 7;
+    unsigned conf : 2;
 
     PATTERN_ENTRY () {
         tag = 0;
@@ -49,13 +49,9 @@ static unsigned degree = START_DEGREE;
 static uint64_t uniform_requests = 0, pattern_requests = 0;
 static uint64_t miss_new_ip = 0, miss_predicted = 0, miss_unpredicted = 0;
 
-static void touch_tracker(int index)
+static uint32_t ip_hash(uint64_t ip)
 {
-    for (int i=0; i<IP_TRACKER_COUNT; i++) {
-        if (trackers[i].lru < trackers[index].lru)
-            trackers[i].lru++;
-    }
-    trackers[index].lru = 0;
+    return (uint32_t)(ip ^ (ip >> 14) ^ (ip >> 28) ^ (ip >> 42));
 }
 
 static unsigned next_signature(unsigned sig, int64_t stride)
@@ -130,8 +126,6 @@ static void update_degree(uint64_t useful, uint64_t useless)
 void CACHE::l1d_prefetcher_initialize()
 {
     cout << "CPU " << cpu << " L1D Stride Pattern Prefetcher (signature)" << endl;
-    for (int i=0; i<IP_TRACKER_COUNT; i++)
-        trackers[i].lru = i;
 }
 
 void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag)
@@ -142,25 +136,17 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
         return;
 
     uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;
+    uint16_t cl_addr_low = (uint16_t)cl_addr;
 
-    int index;
-    for (index=0; index<IP_TRACKER_COUNT; index++) {
-        if (trackers[index].ip == ip)
-            break;
-    }
+    uint32_t h = ip_hash(ip);
+    unsigned index = h & (IP_TRACKER_COUNT - 1);
+    unsigned tag = (h >> 7) & 0xFF;
 
-    if (index == IP_TRACKER_COUNT) {
-        for (index=0; index<IP_TRACKER_COUNT; index++) {
-            if (trackers[index].lru == (IP_TRACKER_COUNT-1))
-                break;
-        }
-
-        uint32_t lru = trackers[index].lru;
+    if (!trackers[index].valid || trackers[index].tag != tag) {
         trackers[index] = IP_ENTRY();
-        trackers[index].lru = lru;
-        trackers[index].ip = ip;
-        trackers[index].last_cl_addr = cl_addr;
-        touch_tracker(index);
+        trackers[index].valid = 1;
+        trackers[index].tag = tag;
+        trackers[index].last_cl_addr = cl_addr_low;
 
         if (!cache_hit)
             miss_new_ip++;
@@ -169,13 +155,12 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
 
     IP_ENTRY &t = trackers[index];
 
-    int64_t stride = (int64_t)(cl_addr - t.last_cl_addr);
-    t.last_cl_addr = cl_addr;
+    int64_t stride = (int16_t)(uint16_t)(cl_addr_low - t.last_cl_addr);
+    t.last_cl_addr = cl_addr_low;
 
     if (stride == 0 || stride > 63 || stride < -64) {
         if (!cache_hit)
             miss_unpredicted++;
-        touch_tracker(index);
         return;
     }
 
@@ -248,8 +233,6 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
             sig = next_signature(sig, next);
         }
     }
-
-    touch_tracker(index);
 }
 
 void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t v_evicted_addr, uint64_t evicted_addr, uint32_t metadata_in)
