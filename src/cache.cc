@@ -556,7 +556,7 @@ void CACHE::handle_fill()
             {
                 uint32_t victim_way;
                 victim_way = ooo_cpu[fill_cpu].DTLB_PB.find_victim( fill_cpu, MSHR.entry[mshr_index].instr_id, 0, ooo_cpu[fill_cpu].DTLB_PB.block[0] , MSHR.entry[mshr_index].ip, MSHR.entry[mshr_index].full_addr, MSHR.entry[mshr_index].type);
-                ooo_cpu[fill_cpu].DTLB_PB.update_replacement_state(fill_cpu, 0, way, MSHR.entry[mshr_index].full_addr, MSHR.entry[mshr_index].ip, ooo_cpu[fill_cpu].DTLB_PB.block[0][victim_way].full_addr, MSHR.entry[mshr_index].type, 0);
+                ooo_cpu[fill_cpu].DTLB_PB.update_replacement_state(fill_cpu, 0, way, MSHR.entry[mshr_index].full_addr, MSHR.entry[mshr_index].ip, ooo_cpu[fill_cpu].DTLB_PB.block[0][victim_way].full_addr, MSHR.entry[mshr_index].type, 0, MSHR.entry[mshr_index].instruction);
                 ooo_cpu[fill_cpu].DTLB_PB.fill_cache( 0, victim_way, &MSHR.entry[mshr_index] );
             }
 #endif
@@ -1540,7 +1540,7 @@ if((cache_type == IS_L1I || cache_type == IS_L1D) && reads_ready.size() == 0)
                     ooo_cpu[read_cpu].DTLB_PB.sim_access[read_cpu][RQ.entry[index].type]++;
                     ooo_cpu[read_cpu].DTLB_PB.HIT[RQ.entry[index].type]++;
                     ooo_cpu[read_cpu].DTLB_PB.ACCESS[RQ.entry[index].type]++;
-                    ooo_cpu[read_cpu].DTLB_PB.update_replacement_state(read_cpu, 0, way_pb, ooo_cpu[read_cpu].DTLB_PB.block[0][way_pb].full_addr, RQ.entry[index].ip, 0, RQ.entry[index].type, 1);
+                    ooo_cpu[read_cpu].DTLB_PB.update_replacement_state(read_cpu, 0, way_pb, ooo_cpu[read_cpu].DTLB_PB.block[0][way_pb].full_addr, RQ.entry[index].ip, 0, RQ.entry[index].type, 1, RQ.entry[index].instruction);
                     RQ.entry[index].data = ooo_cpu[read_cpu].DTLB_PB.block[0][way_pb].data;
                     ooo_cpu[read_cpu].DTLB_PB.pf_useful++;
                     // If DTLB prefetch buffer gets hit, fill DTLB and then proceed
